@@ -16,18 +16,19 @@ Detect patterns from transaction data in real time using a two-mechanism archite
 
 ---
 
-## 📁 Project Structure
+## 🔧 Technologies Used
+- PySpark on Databricks
+- AWS S3
+- PostgreSQL (state tracker)
+- GitHub
 
-mechanism_X.py`: Uploads 10K-record chunks from transactions.csv to S3 every second.
-- `mechanism_Y.py`: Consumes chunks from S3, runs PatId1/2/3 pattern logic in PySpark.
-- `CustomerImportance.csv`: Importance weights used in PatId1.
-- `config.py`: AWS + DB creds.
-- `README.md`: This file.
+## 📂 Project Structure
+- `Assignment_Dev_dolph.py` – contains full Mechanism X + Y logic
+- `.gitignore` – hides `.env`, data files, etc.
+- `README.md` – project setup & usage
 
----
-
-### 📁 Output Files
-- Location: `s3a://pyspark-assignment-sonu/output/`
-- Zipped Final: [📦 Download ZIP](https://pyspark-assignment-sonu.s3.ap-south-1.amazonaws.com/final_submission/final_outputs.zip)
-
----
+## 🛠️ Setup Instructions
+1. Set AWS credentials as environment variables:
+AWS_ACCESS_KEY_ID=AKIARSF3WSEJI2XYV6PB
+AWS_SECRET_ACCESS_KEY=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
+AWS_REGION=ap-south-1
