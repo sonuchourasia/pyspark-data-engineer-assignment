@@ -1,0 +1,214 @@
+
+import os
+from dotenv import load_dotenv
+import pandas as pd
+import boto3
+from datetime import datetime
+from time import sleep
+from pyspark.sql.functions import col, count, avg, percentile_approx, current_timestamp
+from pyspark.sql.functions import col, avg, count, countDistinct, current_timestamp, percentile_approx
+
+from pyspark.sql.window import Window
+import shutil
+
+# Load .env variables
+load_dotenv()
+
+# S3 config
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION", "ap-south-1")
+)
+bucket = "pyspark-assignment-sonu"
+s3_prefix = "input/"
+
+# Load full data
+df_spark = spark.read.csv("dbfs:/FileStore/transactions-1.csv", header=True, inferSchema=True)
+df = df_spark.toPandas()
+
+# Delta path for state tracker
+state_path = "dbfs:/FileStore/state_tracker"
+
+# Initialize table
+if not spark._jsparkSession.catalog().tableExists("state_tracker"):
+    spark.createDataFrame([("X", 0)]).toDF("component", "last_index") \
+        .write.format("delta").mode("overwrite").save(state_path)
+    spark.sql(f"CREATE TABLE state_tracker USING DELTA LOCATION '{state_path}'")
+
+def get_last_index():
+    return spark.sql("SELECT last_index FROM state_tracker WHERE component = 'X'").collect()[0][0]
+
+def update_index(new_index):
+    spark.sql("DELETE FROM state_tracker WHERE component = 'X'")
+    spark.sql(f"INSERT INTO state_tracker VALUES ('X', {new_index})")
+
+def upload_chunk():
+    idx = get_last_index()
+    chunk = df.iloc[idx:idx+10000]
+    if chunk.empty:
+        print("\u2705 All chunks uploaded.")
+        return False
+
+    filename = f"txn_chunk_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+    chunk.to_csv(f"/tmp/{filename}", index=False)
+    s3.upload_file(f"/tmp/{filename}", bucket, f"{s3_prefix}{filename}")
+    update_index(idx + 10000)
+    print(f"\u2705 Uploaded chunk from index {idx}")
+    return True
+
+# Start streaming
+for _ in range(1000):
+    if not upload_chunk():
+        break
+    sleep(1)
+
+
+spark.conf.set("spark.sql.files.ignoreCorruptFiles", "true")
+spark.conf.set("spark.sql.shuffle.partitions", 4)
+
+customer_imp_df = spark.read.csv("dbfs:/FileStore/CustomerImportance.csv", header=True, inferSchema=True) \
+    .withColumnRenamed("Source", "CustomerName") \
+    .withColumnRenamed("typeTrans", "TransactionType") \
+    .withColumnRenamed("Weight", "ImportanceWeight")
+
+customer_imp_df.createOrReplaceTempView("customer_importance")
+
+# Start reading from S3 input folder
+# Set S3 credentials for Spark
+spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", os.getenv("AWS_ACCESS_KEY_ID"))
+spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", os.getenv("AWS_SECRET_ACCESS_KEY"))
+spark._jsc.hadoopConfiguration().set("fs.s3a.endpoint", "s3.amazonaws.com")
+spark._jsc.hadoopConfiguration().set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
+# Then safely read from S3 using s3a://
+txn_df = spark.read \
+    .format("csv") \
+    .option("header", "true") \
+    .load("s3a://pyspark-assignment-sonu/input/")
+
+
+txn_df.createOrReplaceTempView("transactions_stream")
+
+# PatId1 Logic
+
+txn_df = txn_df.withColumnRenamed("customer", "CustomerName") \
+    .withColumnRenamed("merchant", "MerchantId") \
+    .withColumnRenamed("amount", "Amount") \
+    .withColumnRenamed("category", "TransactionType") \
+    .withColumnRenamed("gender", "Gender")
+
+merchant_txn_counts = txn_df.groupBy("MerchantId") \
+    .count().withColumnRenamed("count", "merchant_txn_count") \
+    .filter("merchant_txn_count >= 50000")
+
+customer_txn_counts = txn_df.groupBy("CustomerName", "MerchantId") \
+    .count().withColumnRenamed("count", "customer_txn_count")
+
+joined = customer_txn_counts.join(merchant_txn_counts, "MerchantId")
+
+window_spec = Window.partitionBy("MerchantId")
+top_customers = joined.withColumn(
+    "top_threshold",
+    percentile_approx("customer_txn_count", 0.9).over(window_spec)
+).filter("customer_txn_count >= top_threshold")
+
+weighted = txn_df.join(customer_imp_df, ["CustomerName", "TransactionType"], "left")
+weights = weighted.groupBy("CustomerName", "MerchantId") \
+    .agg(avg("ImportanceWeight").alias("avg_weight"))
+
+low_weight_customers = weights.withColumn(
+    "weight_threshold",
+    percentile_approx("avg_weight", 0.1).over(window_spec)
+).filter("avg_weight <= weight_threshold")
+
+patid1_df = top_customers.join(
+    low_weight_customers, ["CustomerName", "MerchantId"]
+).selectExpr(
+    "current_timestamp() as detectionTime",
+    "current_timestamp() as YStartTime",
+    "'PatId1' as patternId",
+    "'UPGRADE' as ActionType",
+    "CustomerName",
+    "MerchantId"
+)
+
+patid1_df.coalesce(1).write \
+    .mode("append") \
+    .json("s3a://pyspark-assignment-sonu/output/")
+
+# PatId2 Logic
+
+patid2_grouped = txn_df.groupBy("CustomerName", "MerchantId") \
+    .agg(
+        avg("Amount").alias("avg_amount"),
+        count("*").alias("txn_count")
+    )
+
+patid2_df = patid2_grouped.filter(
+    (col("avg_amount") < 23) & (col("txn_count") >= 80)
+).selectExpr(
+    "current_timestamp() as detectionTime",
+    "current_timestamp() as YStartTime",
+    "'PatId2' as patternId",
+    "'CHILD' as ActionType",
+    "CustomerName",
+    "MerchantId"
+)
+
+patid2_df.coalesce(1).write \
+    .mode("append") \
+    .json("s3a://pyspark-assignment-sonu/output/")
+
+
+# PatId3 Logic
+
+gender_counts = txn_df.groupBy("MerchantId", "Gender") \
+    .agg(countDistinct("CustomerName").alias("customer_count"))
+
+females = gender_counts.filter(col("Gender") == "F") \
+    .withColumnRenamed("customer_count", "female_count") \
+    .drop("Gender")
+
+males = gender_counts.filter(col("Gender") == "M") \
+    .withColumnRenamed("customer_count", "male_count") \
+    .drop("Gender")
+
+dei_check = females.join(males, on="MerchantId", how="inner")
+
+patid3_df = dei_check.filter(
+    (col("female_count") > 100) & (col("female_count") < col("male_count"))
+).selectExpr(
+    "current_timestamp() as detectionTime",
+    "current_timestamp() as YStartTime",
+    "'PatId3' as patternId",
+    "'DEI-NEEDED' as ActionType",
+    "'' as CustomerName",
+    "MerchantId"
+)
+
+patid3_df.coalesce(1).write \
+    .mode("append") \
+    .json("s3a://pyspark-assignment-sonu/output/")
+
+
+
+# Download and zip final outputs
+
+local_dir = "/tmp/s3_outputs/"
+os.makedirs(local_dir, exist_ok=True)
+
+objects = s3.list_objects_v2(Bucket=bucket, Prefix="output/")
+for obj in objects.get("Contents", []):
+    key = obj["Key"]
+    if key.endswith(".json"):
+        local_path = os.path.join(local_dir, os.path.basename(key))
+        s3.download_file(bucket, key, local_path)
+
+zip_path = "/tmp/final_outputs.zip"
+shutil.make_archive("/tmp/final_outputs", 'zip', local_dir)
+
+s3.upload_file(zip_path, bucket, "final_submission/final_outputs.zip")
+
+print("\u2705 Downloadable link:", f"https://{bucket}.s3.ap-south-1.amazonaws.com/final_submission/final_outputs.zip")
