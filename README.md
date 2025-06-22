@@ -18,3 +18,16 @@ Detect patterns from transaction data in real time using a two-mechanism archite
 
 ## 📁 Project Structure
 
+mechanism_X.py`: Uploads 10K-record chunks from transactions.csv to S3 every second.
+- `mechanism_Y.py`: Consumes chunks from S3, runs PatId1/2/3 pattern logic in PySpark.
+- `CustomerImportance.csv`: Importance weights used in PatId1.
+- `config.py`: AWS + DB creds.
+- `README.md`: This file.
+
+---
+
+### 📁 Output Files
+- Location: `s3a://pyspark-assignment-sonu/output/`
+- Zipped Final: [📦 Download ZIP](https://pyspark-assignment-sonu.s3.ap-south-1.amazonaws.com/final_submission/final_outputs.zip)
+
+---
